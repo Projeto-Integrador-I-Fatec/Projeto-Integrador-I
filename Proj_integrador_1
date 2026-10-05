@@ -1,0 +1,680 @@
+# ==========================================================
+# PROJETO INTEGRADOR 1
+# ANÁLISE DO BANCO DE DADOS HOSPITALAR
+# ==========================================================
+
+import os
+import re
+import unicodedata
+
+import pandas as pd
+
+
+# ==========================================================
+# 1. CONFIGURAÇÃO
+# ==========================================================
+
+banco_dados = "santa_casa.registros_medicos.json"
+
+
+# ==========================================================
+# 2. VERIFICAÇÃO E LEITURA DO BANCO
+# ==========================================================
+
+if not os.path.exists(banco_dados):
+    raise FileNotFoundError(
+        f"O arquivo '{banco_dados}' não foi encontrado."
+    )
+
+df = pd.read_json(banco_dados)
+
+
+# ==========================================================
+# 3. FUNÇÕES AUXILIARES
+# ==========================================================
+
+def remover_acentos(texto):
+    """Remove acentos de um texto."""
+
+    if pd.isna(texto):
+        return texto
+
+    texto = str(texto)
+
+    return "".join(
+        caractere
+        for caractere in unicodedata.normalize("NFD", texto)
+        if unicodedata.category(caractere) != "Mn"
+    )
+
+
+def extrair_cid(informacoes):
+    """Extrai código e descrição dos CIDs."""
+
+    lista_cid = informacoes.get("cid", [])
+
+    if not isinstance(lista_cid, list):
+        return None, None
+
+    codigos = []
+    descricoes = []
+
+    for item in lista_cid:
+
+        if not isinstance(item, dict):
+            continue
+
+        cid = item.get("cid")
+        descricao = item.get("descricao")
+
+        if cid:
+            codigos.append(str(cid))
+
+        if descricao:
+            descricoes.append(str(descricao))
+
+    return (
+        "; ".join(codigos) if codigos else None,
+        "; ".join(descricoes) if descricoes else None
+    )
+
+
+def extrair_data(data):
+    """Converte datas armazenadas em estruturas MongoDB."""
+
+    if isinstance(data, dict):
+
+        if "$date" in data:
+            return data["$date"]
+
+        if "$numberLong" in data:
+
+            try:
+                return pd.to_datetime(
+                    int(data["$numberLong"]),
+                    unit="ms",
+                    utc=True
+                )
+            except (ValueError, TypeError):
+                return None
+
+    return data
+
+
+# ==========================================================
+# 4. LIMPEZA DAS QUEIXAS
+# ==========================================================
+
+PADROES_SINAIS_VITAIS = [
+    # Pressão arterial
+    r"\b(?:PA|PRESSAO)\s*[:=]?\s*\d+\s*[Xx/]\s*\d+(?:\s*MMHG)?\b",
+
+    # Saturação
+    r"\b(?:SAT|SATO2|SPO2|SPO|STO2|ST)\s*[:=]?\s*\d+(?:[,.]\d+)?\s*%?\b",
+
+    # Frequência cardíaca
+    r"\b(?:FC|FREQUENCIA CARDIACA)\s*[:=]?\s*\d+(?:\s*BPM)?\b",
+
+    # Temperatura
+    r"\b(?:TEMPERATURA|TEMP)\s*[:=]?\s*\d+(?:[,.]\d+)?\s*[°º]?\s*[Cc]?\b",
+
+    # Frequência respiratória
+    r"\b(?:FR|FREQUENCIA RESPIRATORIA)\s*[:=]?\s*\d+(?:\s*IRPM)?\b",
+
+    # Glicemia / dextro
+    r"\b(?:GLICEMIA|GLIC|DEXTRO|DX)\s*[:=]?\s*\d+\b",
+
+    # Pulso
+    r"\b(?:PULSO|PU)\s*[:=]?\s*\d+\b",
+
+    # Peso
+    r"\bPESO\s*[:=]?\s*\d+(?:[,.]\d+)?\s*(?:KG)?\b",
+
+    # Sinais vitais
+    r"\bSSVV\b"
+]
+
+
+def limpar_queixa(texto):
+    if pd.isna(texto):
+        return pd.NA
+
+    texto = str(texto).upper()
+    texto = remover_acentos(texto)
+
+    # Remove os sinais vitais conhecidos
+    for padrao in PADROES_SINAIS_VITAIS:
+        texto = re.sub(
+            padrao,
+            " ",
+            texto,
+            flags=re.IGNORECASE
+        )
+
+    # Remove valores isolados que sobraram de registros mal formatados
+    texto = re.sub(
+        r"(?<!\w)\d+(?:[,.]\d+)?\s*%",
+        " ",
+        texto
+    )
+
+    # Remove valores isolados de temperatura mal formatados
+    texto = re.sub(
+        r"\b\d{1,3}[,.]\d+\s*[°º]?\s*[Cc]\b",
+        " ",
+        texto
+    )
+
+    # Remove quebras de linha
+    texto = texto.replace("\r", " ")
+    texto = texto.replace("\n", " ")
+
+    # Remove pontuação
+    texto = re.sub(r"[.,;:!?]+", " ", texto)
+
+    # Remove símbolos de temperatura
+    texto = re.sub(r"[°º]+", " ", texto)
+
+    # Junta espaços duplicados
+    texto = re.sub(r"\s+", " ", texto)
+
+    texto = texto.strip()
+
+    return texto if texto else pd.NA
+
+# ==========================================================
+# 5. CLASSIFICAÇÃO DAS QUEIXAS
+# ==========================================================
+
+PADROES_ADMINISTRATIVOS = [
+
+    r"\bNAO RESPONDEU\b",
+    r"\bNAO RESPONDE\b",
+    r"\bNAO ATENDEU\b",
+    r"\bNAO ATENDE\b",
+    r"\bNAO AGUARDOU\b",
+    r"\bJA ATENDIDO\b",
+    r"\bJA ATENDIDA\b",
+    r"\bNAO COMPARECEU\b",
+    r"\bABANDONOU\b"
+]
+
+
+PADROES_PROCEDIMENTOS = [
+
+    r"\bMEDICACAO EXTERNA\b",
+    r"\bCURATIVO\b",
+    r"\bSUTURA\b",
+    r"\bRETIRADA DE PONTO\b",
+    r"\bRETIRADA DE PONTOS\b",
+    r"\bTROCA DE SNE\b",
+    r"\bTROCA DE SVD\b",
+    r"\bCOLETA\b",
+    r"\bAPLICACAO\b",
+    r"\bRAIO X\b",
+    r"\bRX\b",
+    r"\bULTRASSOM\b"
+]
+
+
+PADROES_CLINICOS = [
+
+    r"\bDOR\b",
+    r"\bFEBRE\b",
+    r"\bCEFALEIA\b",
+    r"\bTOSSE\b",
+    r"\bDIARREIA\b",
+    r"\bVOMITO\b",
+    r"\bNAUSEA\b",
+    r"\bTONTURA\b",
+    r"\bFALTA DE AR\b",
+    r"\bDISPNEIA\b",
+    r"\bCOLICA\b",
+    r"\bSANGRAMENTO\b",
+    r"\bARDENCIA\b",
+    r"\bFERIMENTO\b",
+    r"\bINCHACO\b",
+    r"\bTRAUMA\b",
+    r"\bLOMBALGIA\b",
+    r"\bODINOFAGIA\b",
+    r"\bENXAQUECA\b",
+    r"\bCONVULS\w*\b",
+    r"\bCRISE HIPERTENSIVA\b",
+    r"\bPICO HIPERTENSIVO\b",
+    r"\bQUEIMACAO\b",
+    r"\bCOCEIRA\b",
+    r"\bCORIZA\b",
+    r"\bMIALGIA\b"
+]
+
+
+def contem_padrao(texto, padroes):
+    """Verifica se algum padrão está presente no texto."""
+
+    return any(
+        re.search(padrao, texto)
+        for padrao in padroes
+    )
+
+
+def classificar_queixa(texto):
+
+    if pd.isna(texto):
+        return "OUTROS"
+
+    texto = str(texto)
+
+    # Prioridade 1: administrativo
+    if contem_padrao(
+        texto,
+        PADROES_ADMINISTRATIVOS
+    ):
+        return "ADMINISTRATIVO"
+
+    # Prioridade 2: procedimento
+    if contem_padrao(
+        texto,
+        PADROES_PROCEDIMENTOS
+    ):
+        return "PROCEDIMENTO"
+
+    # Prioridade 3: clínica
+    if contem_padrao(
+        texto,
+        PADROES_CLINICOS
+    ):
+        return "CLINICA"
+
+    # Restante
+    return "OUTROS"
+
+
+# ==========================================================
+# 6. CONSTRUÇÃO DA TABELA DE ANÁLISE
+# ==========================================================
+
+dados_analise = []
+
+for paciente in df.itertuples(index=False):
+
+    registros = getattr(
+        paciente,
+        "registros",
+        []
+    )
+
+    if not isinstance(registros, list):
+        continue
+
+    for registro in registros:
+
+        if not isinstance(registro, dict):
+            continue
+
+        tipo = registro.get("tipo")
+
+        # Mantém somente TRIAGEM e ATENDIMENTO
+        if tipo not in {"TRIAGEM", "ATENDIMENTO"}:
+            continue
+
+        informacoes = registro.get(
+            "informacoes",
+            {}
+        )
+
+        if not isinstance(informacoes, dict):
+            informacoes = {}
+
+        cid, cid_descricao = extrair_cid(
+            informacoes
+        )
+
+        dados_analise.append({
+
+            "tipo": tipo,
+
+            "atendimentoId":
+                informacoes.get("atendimentoId"),
+
+            "dataEntrada":
+                extrair_data(
+                    registro.get("dataEntrada")
+                ),
+
+            "queixa":
+                informacoes.get("queixa"),
+
+            "diagnostico":
+                informacoes.get("diagnostico"),
+
+            "cid":
+                cid,
+
+            "cid_descricao":
+                cid_descricao
+        })
+
+
+df_analise = pd.DataFrame(
+    dados_analise
+)
+
+
+# ==========================================================
+# 7. DATAS
+# ==========================================================
+
+df_analise["dataEntrada"] = pd.to_datetime(
+    df_analise["dataEntrada"],
+    utc=True,
+    errors="coerce"
+)
+
+df_analise["ano"] = (
+    df_analise["dataEntrada"].dt.year
+)
+
+df_analise["mes"] = (
+    df_analise["dataEntrada"].dt.month
+)
+
+df_analise["ano_mes"] = (
+    df_analise["dataEntrada"]
+    .dt.tz_localize(None)
+    .dt.to_period("M")
+)
+
+
+# ==========================================================
+# 8. SEPARAÇÃO DAS TABELAS
+# ==========================================================
+
+df_atendimentos = df_analise.loc[
+    df_analise["tipo"] == "ATENDIMENTO"
+].copy()
+
+
+df_triagens = df_analise.loc[
+    df_analise["tipo"] == "TRIAGEM"
+].copy()
+
+
+# ==========================================================
+# 9. LIMPEZA DAS QUEIXAS
+# ==========================================================
+
+df_triagens["queixa_limpa"] = (
+    df_triagens["queixa"]
+    .apply(limpar_queixa)
+)
+
+
+# ==========================================================
+# 10. CLASSIFICAÇÃO
+# ==========================================================
+
+df_triagens["tipo_queixa"] = (
+    df_triagens["queixa_limpa"]
+    .apply(classificar_queixa)
+)
+
+
+# ==========================================================
+# 11. INDICADORES PRINCIPAIS
+# ==========================================================
+
+total_registros = len(df)
+
+total_registros_analise = len(df_analise)
+
+total_atendimentos = len(
+    df_atendimentos
+)
+
+total_triagens = len(
+    df_triagens
+)
+
+atendimentos_com_cid = int(
+    df_atendimentos["cid"].notna().sum()
+)
+
+atendimentos_sem_cid = int(
+    df_atendimentos["cid"].isna().sum()
+)
+
+triagens_com_queixa = int(
+    df_triagens["queixa"].notna().sum()
+)
+
+triagens_sem_queixa = int(
+    df_triagens["queixa"].isna().sum()
+)
+
+
+# ==========================================================
+# 12. VOLUME DE ATENDIMENTOS
+# ==========================================================
+
+volume_por_ano = (
+
+    df_analise
+    .dropna(subset=["ano"])
+    .groupby(
+        ["ano", "tipo"]
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+    .sort_values(
+        ["ano", "tipo"]
+    )
+)
+
+
+volume_mensal = (
+
+    df_analise
+    .dropna(subset=["ano_mes"])
+    .groupby(
+        ["ano_mes", "tipo"]
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+    .sort_values(
+        ["ano_mes", "tipo"]
+    )
+)
+
+
+# ==========================================================
+# 13. CIDs MAIS FREQUENTES
+# ==========================================================
+
+cids_frequentes = (
+
+    df_atendimentos
+    .dropna(
+        subset=["cid"]
+    )
+    .groupby(
+        ["cid", "cid_descricao"]
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+    .sort_values(
+        "quantidade",
+        ascending=False
+    )
+)
+
+
+# ==========================================================
+# 14. QUEIXAS MAIS FREQUENTES
+# ==========================================================
+
+queixas_frequentes = (
+
+    df_triagens
+    .dropna(
+        subset=["queixa_limpa"]
+    )
+    .groupby(
+        "queixa_limpa"
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+    .sort_values(
+        "quantidade",
+        ascending=False
+    )
+)
+
+
+# ==========================================================
+# 15. CATEGORIAS DE QUEIXA
+# ==========================================================
+
+quantidade_por_tipo_queixa = (
+
+    df_triagens
+    .groupby(
+        "tipo_queixa"
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+    .sort_values(
+        "quantidade",
+        ascending=False
+    )
+)
+
+
+# ==========================================================
+# 16. QUEIXAS POR PERÍODO
+# ==========================================================
+
+queixas_por_periodo = (
+
+    df_triagens
+    .dropna(
+        subset=[
+            "ano_mes",
+            "queixa_limpa"
+        ]
+    )
+    .groupby(
+        [
+            "ano_mes",
+            "queixa_limpa"
+        ]
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+)
+
+
+# ==========================================================
+# 17. CIDs POR PERÍODO
+# ==========================================================
+
+cids_por_periodo = (
+
+    df_atendimentos
+    .dropna(
+        subset=[
+            "ano_mes",
+            "cid"
+        ]
+    )
+    .groupby(
+        [
+            "ano_mes",
+            "cid",
+            "cid_descricao"
+        ]
+    )
+    .size()
+    .reset_index(
+        name="quantidade"
+    )
+)
+
+
+# ==========================================================
+# 18. RESULTADO RESUMIDO
+# ==========================================================
+
+print(
+    f"""
+============================================================
+BANCO DE DADOS CARREGADO
+============================================================
+
+Registros originais:       {total_registros:,}
+Registros para análise:    {total_registros_analise:,}
+
+Atendimentos:              {total_atendimentos:,}
+Triagens:                   {total_triagens:,}
+
+Atendimentos com CID:      {atendimentos_com_cid:,}
+Atendimentos sem CID:      {atendimentos_sem_cid:,}
+
+Triagens com queixa:       {triagens_com_queixa:,}
+Triagens sem queixa:       {triagens_sem_queixa:,}
+
+Queixas clínicas:           {
+    int(
+        quantidade_por_tipo_queixa.loc[
+            quantidade_por_tipo_queixa["tipo_queixa"] == "CLINICA",
+            "quantidade"
+        ].sum()
+    )
+:,}
+
+Queixas de procedimento:    {
+    int(
+        quantidade_por_tipo_queixa.loc[
+            quantidade_por_tipo_queixa["tipo_queixa"] == "PROCEDIMENTO",
+            "quantidade"
+        ].sum()
+    )
+:,}
+
+Queixas administrativas:    {
+    int(
+        quantidade_por_tipo_queixa.loc[
+            quantidade_por_tipo_queixa["tipo_queixa"] == "ADMINISTRATIVO",
+            "quantidade"
+        ].sum()
+    )
+:,}
+
+============================================================
+PROCESSAMENTO CONCLUÍDO
+============================================================
+"""
+)
+
+print("\nEXEMPLOS DE LIMPEZA DAS QUEIXAS")
+print("=" * 60)
+
+print(
+    df_triagens[
+        ["queixa", "queixa_limpa"]
+    ]
+    .dropna(subset=["queixa_limpa"])
+    .head(20)
+    .to_string(index=False)
+)
