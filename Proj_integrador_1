@@ -1,680 +1,1262 @@
-# ==========================================================
-# PROJETO INTEGRADOR 1
-# ANÁLISE DO BANCO DE DADOS HOSPITALAR
-# ==========================================================
+
+# ============================================================
+# PROJETO INTEGRADOR I
+# VERSAO 3.6 - CORRECAO DOS MEDICAMENTOS
+#
+# Objetivos:
+# 1. Investigar a estrutura do campo medicamento
+# 2. Extrair nomes de dicionarios, listas e textos
+# 3. Verificar a qualidade dos nomes extraidos
+# 4. Preservar a origem das datas
+# 5. Validar os vinculos com atendimentos
+# 6. Gerar tabelas agregadas para o dashboard
+#
+# Nao altera o JSON original.
+# Nao exporta CPF, nome ou identificador de paciente.
+# ============================================================
 
 import os
 import re
+import json
 import unicodedata
+from collections import Counter
 
 import pandas as pd
 
 
-# ==========================================================
-# 1. CONFIGURAÇÃO
-# ==========================================================
+# ============================================================
+# 1. CONFIGURACOES
+# ============================================================
 
-banco_dados = "santa_casa.registros_medicos.json"
+ARQUIVO = "santa_casa.registros_medicos.json"
+
+PASTA_SAIDA = "resultados_v36"
+
+# MODOS:
+# AUDITORIA -> Investiga estrutura e nomes
+# COMPLETO  -> Investiga, valida e exporta CSVs
+
+MODO = "COMPLETO"
+
+MAX_PROFUNDIDADE = 6
 
 
-# ==========================================================
-# 2. VERIFICAÇÃO E LEITURA DO BANCO
-# ==========================================================
+# ============================================================
+# 2. FUNCOES AUXILIARES
+# ============================================================
 
-if not os.path.exists(banco_dados):
-    raise FileNotFoundError(
-        f"O arquivo '{banco_dados}' não foi encontrado."
+def normalizar_texto(valor):
+
+    if not isinstance(valor, str):
+        return ""
+
+    texto = unicodedata.normalize(
+        "NFD",
+        valor.upper()
     )
 
-df = pd.read_json(banco_dados)
+    texto = "".join(
+        c for c in texto
+        if unicodedata.category(c) != "Mn"
+    )
+
+    return re.sub(
+        r"\s+", " ", texto
+    ).strip()
 
 
-# ==========================================================
-# 3. FUNÇÕES AUXILIARES
-# ==========================================================
+def texto_seguro(valor):
 
-def remover_acentos(texto):
-    """Remove acentos de um texto."""
+    if valor is None:
+        return ""
 
-    if pd.isna(texto):
-        return texto
+    if isinstance(valor, (dict, list, tuple)):
+        return ""
 
-    texto = str(texto)
+    try:
+        if pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        return ""
 
-    return "".join(
-        caractere
-        for caractere in unicodedata.normalize("NFD", texto)
-        if unicodedata.category(caractere) != "Mn"
+    return str(valor).strip()
+
+
+def identificador(valor):
+
+    if isinstance(valor, dict):
+
+        valor = valor.get(
+            "$oid",
+            valor.get("$numberLong")
+        )
+
+    if valor is None:
+        return None
+
+    try:
+        if pd.isna(valor):
+            return None
+    except (TypeError, ValueError):
+        return None
+
+    if isinstance(valor, float) and valor.is_integer():
+        valor = int(valor)
+
+    resultado = str(valor).strip()
+
+    return resultado if resultado else None
+
+
+def carregar_banco():
+
+    if not os.path.exists(ARQUIVO):
+
+        raise FileNotFoundError(
+            f"Arquivo nao encontrado: {ARQUIVO}"
+        )
+
+    print("\nCARREGANDO BANCO DE DADOS...")
+
+    df = pd.read_json(ARQUIVO)
+
+    print("BANCO CARREGADO COM SUCESSO")
+    print(f"Pacientes: {len(df):,}")
+
+    return df
+
+
+def exportar_csv(tabela, nome):
+
+    os.makedirs(
+        PASTA_SAIDA,
+        exist_ok=True
+    )
+
+    caminho = os.path.join(
+        PASTA_SAIDA,
+        nome
+    )
+
+    tabela.to_csv(
+        caminho,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    print(
+        f"{nome}: {len(tabela):,} linhas"
     )
 
 
-def extrair_cid(informacoes):
-    """Extrai código e descrição dos CIDs."""
+# ============================================================
+# 3. TRATAMENTO DE DATAS
+# ============================================================
 
-    lista_cid = informacoes.get("cid", [])
+def converter_data(valor):
 
-    if not isinstance(lista_cid, list):
-        return None, None
+    if isinstance(valor, dict):
 
-    codigos = []
-    descricoes = []
+        if "$date" in valor:
+            return converter_data(valor["$date"])
 
-    for item in lista_cid:
+        if "$numberLong" in valor:
+            valor = valor["$numberLong"]
 
-        if not isinstance(item, dict):
-            continue
+    if valor is None:
+        return pd.NaT
 
-        cid = item.get("cid")
-        descricao = item.get("descricao")
+    if isinstance(valor, str):
 
-        if cid:
-            codigos.append(str(cid))
+        valor = valor.strip()
 
-        if descricao:
-            descricoes.append(str(descricao))
+        if valor.lower() in {
+            "", "none", "null", "nan", "nat"
+        }:
+            return pd.NaT
+
+        if re.fullmatch(r"\d{13}", valor):
+
+            return pd.to_datetime(
+                int(valor),
+                unit="ms",
+                utc=True,
+                errors="coerce"
+            )
+
+        if re.fullmatch(r"\d{10}", valor):
+
+            return pd.to_datetime(
+                int(valor),
+                unit="s",
+                utc=True,
+                errors="coerce"
+            )
+
+    try:
+
+        return pd.to_datetime(
+            valor,
+            utc=True,
+            errors="coerce"
+        )
+
+    except (
+        TypeError,
+        ValueError,
+        OverflowError
+    ):
+
+        return pd.NaT
+
+
+def converter_coluna_datas(serie):
+
+    cache = {}
+    resultado = []
+
+    for valor in serie:
+
+        try:
+            chave = json.dumps(
+                valor,
+                sort_keys=True,
+                default=str,
+                ensure_ascii=False
+            )
+        except (TypeError, ValueError):
+            chave = repr(valor)
+
+        if chave not in cache:
+            cache[chave] = converter_data(valor)
+
+        resultado.append(cache[chave])
+
+    return pd.to_datetime(
+        pd.Series(
+            resultado,
+            index=serie.index
+        ),
+        utc=True,
+        errors="coerce"
+    )
+
+
+# ============================================================
+# 4. INVESTIGACAO DA ESTRUTURA DOS MEDICAMENTOS
+# ============================================================
+
+CONTAGEM_TIPOS = Counter()
+CONTAGEM_CAMPOS = Counter()
+CONTAGEM_CAMINHOS = Counter()
+
+
+def investigar_estrutura(
+    valor,
+    caminho="medicamento",
+    profundidade=0
+):
+
+    CONTAGEM_TIPOS[type(valor).__name__] += 1
+
+    if profundidade > MAX_PROFUNDIDADE:
+        return
+
+    if isinstance(valor, dict):
+
+        for chave, conteudo in valor.items():
+
+            chave = str(chave)
+
+            CONTAGEM_CAMPOS[chave] += 1
+
+            novo_caminho = (
+                f"{caminho}.{chave}"
+            )
+
+            CONTAGEM_CAMINHOS[
+                novo_caminho
+            ] += 1
+
+            investigar_estrutura(
+                conteudo,
+                novo_caminho,
+                profundidade + 1
+            )
+
+    elif isinstance(valor, (list, tuple)):
+
+        for item in valor:
+
+            investigar_estrutura(
+                item,
+                f"{caminho}[]",
+                profundidade + 1
+            )
+
+
+# ============================================================
+# 5. IDENTIFICACAO DOS CAMPOS DE NOME
+# ============================================================
+
+# Os nomes de campos abaixo sao candidatos.
+# O programa nao presume que todos existam no JSON.
+
+CAMPOS_NOME = {
+    "nome",
+    "nomemedicamento",
+    "nomedoproduto",
+    "nomemedicamento",
+    "descricao",
+    "descricaomedicamento",
+    "descricaodomedicamento",
+    "denominacao",
+    "principioativo",
+    "principioativomedicamento",
+    "nomecomercial",
+    "nomegenerico",
+    "produto",
+    "medicamento",
+    "drugname",
+    "name"
+}
+
+CAMPOS_CODIGO = {
+    "codigo",
+    "codigomedicamento",
+    "id",
+    "idmedicamento",
+    "cod",
+    "code"
+}
+
+
+def normalizar_chave(chave):
+
+    texto = normalizar_texto(str(chave))
+
+    return re.sub(
+        r"[^A-Z0-9]",
+        "",
+        texto
+    ).lower()
+
+
+def nome_valido(texto):
+
+    texto = texto_seguro(texto)
+
+    if not texto:
+        return False
+
+    texto_normalizado = normalizar_texto(texto)
+
+    if texto_normalizado in {
+        "NAN",
+        "NONE",
+        "NULL",
+        "NAT",
+        "NAO INFORMADO",
+        "NAO INFORMADA",
+        "SEM INFORMACAO",
+        "SEM DESCRICAO"
+    }:
+        return False
+
+    # Evita tratar um identificador puramente
+    # numerico como nome de medicamento.
+
+    if re.fullmatch(
+        r"[\d\s.,/-]+",
+        texto
+    ):
+        return False
+
+    # O nome deve conter pelo menos uma letra.
+
+    if not re.search(
+        r"[A-Za-zÀ-ÿ]",
+        texto
+    ):
+        return False
+
+    return True
+
+
+def extrair_nome_medicamento(
+    valor,
+    profundidade=0
+):
+
+    """
+    Retorna:
+        (nome, origem)
+
+    A funcao busca nomes em campos conhecidos,
+    preservando a origem da extracao.
+
+    Nao utiliza automaticamente campos
+    desconhecidos como nomes.
+    """
+
+    if profundidade > MAX_PROFUNDIDADE:
+
+        return (
+            "NAO IDENTIFICADO",
+            "LIMITE_PROFUNDIDADE"
+        )
+
+    # --------------------------------------------------------
+    # Caso 1: texto simples
+    # --------------------------------------------------------
+
+    if isinstance(valor, str):
+
+        if nome_valido(valor):
+
+            return (
+                valor.strip(),
+                "TEXTO_DIRETO"
+            )
+
+        return (
+            "NAO IDENTIFICADO",
+            "TEXTO_INVALIDO"
+        )
+
+    # --------------------------------------------------------
+    # Caso 2: dicionario
+    # --------------------------------------------------------
+
+    if isinstance(valor, dict):
+
+        # Primeiro procura campos com nomes conhecidos.
+
+        for chave, conteudo in valor.items():
+
+            chave_normalizada = normalizar_chave(
+                chave
+            )
+
+            if chave_normalizada not in CAMPOS_NOME:
+                continue
+
+            if isinstance(conteudo, str):
+
+                if nome_valido(conteudo):
+
+                    return (
+                        conteudo.strip(),
+                        f"CAMPO:{chave}"
+                    )
+
+            elif isinstance(
+                conteudo,
+                (dict, list, tuple)
+            ):
+
+                nome, origem = (
+                    extrair_nome_medicamento(
+                        conteudo,
+                        profundidade + 1
+                    )
+                )
+
+                if nome != "NAO IDENTIFICADO":
+
+                    return (
+                        nome,
+                        f"{chave}.{origem}"
+                    )
+
+        # Depois procura estruturas aninhadas.
+
+        for chave, conteudo in valor.items():
+
+            if not isinstance(
+                conteudo,
+                (dict, list, tuple)
+            ):
+                continue
+
+            nome, origem = (
+                extrair_nome_medicamento(
+                    conteudo,
+                    profundidade + 1
+                )
+            )
+
+            if nome != "NAO IDENTIFICADO":
+
+                return (
+                    nome,
+                    f"{chave}.{origem}"
+                )
+
+        return (
+            "NAO IDENTIFICADO",
+            "DICIONARIO_SEM_NOME"
+        )
+
+    # --------------------------------------------------------
+    # Caso 3: lista
+    # --------------------------------------------------------
+
+    if isinstance(valor, (list, tuple)):
+
+        nomes = []
+
+        for item in valor:
+
+            nome, origem = (
+                extrair_nome_medicamento(
+                    item,
+                    profundidade + 1
+                )
+            )
+
+            if nome != "NAO IDENTIFICADO":
+
+                if nome not in nomes:
+                    nomes.append(nome)
+
+        if nomes:
+
+            return (
+                " | ".join(nomes),
+                "LISTA"
+            )
+
+        return (
+            "NAO IDENTIFICADO",
+            "LISTA_SEM_NOME"
+        )
+
+    # --------------------------------------------------------
+    # Caso 4: numero, nulo ou outro tipo
+    # --------------------------------------------------------
 
     return (
-        "; ".join(codigos) if codigos else None,
-        "; ".join(descricoes) if descricoes else None
+        "NAO IDENTIFICADO",
+        f"TIPO:{type(valor).__name__}"
     )
 
 
-def extrair_data(data):
-    """Converte datas armazenadas em estruturas MongoDB."""
+# ============================================================
+# 6. EXTRACAO DOS REGISTROS
+# ============================================================
 
-    if isinstance(data, dict):
+def extrair_registros(df):
 
-        if "$date" in data:
-            return data["$date"]
+    medicamentos = []
+    chaves_atendimentos = set()
 
-        if "$numberLong" in data:
+    print("\nEXTRAINDO REGISTROS...")
 
-            try:
-                return pd.to_datetime(
-                    int(data["$numberLong"]),
-                    unit="ms",
-                    utc=True
+    for id_paciente, paciente in enumerate(
+        df.itertuples(index=False)
+    ):
+
+        registros = getattr(
+            paciente,
+            "registros",
+            []
+        )
+
+        if not isinstance(registros, list):
+            continue
+
+        for registro in registros:
+
+            if not isinstance(registro, dict):
+                continue
+
+            tipo = registro.get("tipo")
+
+            informacoes = registro.get(
+                "informacoes",
+                {}
+            )
+
+            if not isinstance(informacoes, dict):
+                informacoes = {}
+
+            atendimento_id = identificador(
+                informacoes.get("atendimentoId")
+            )
+
+            chave = (
+                id_paciente,
+                atendimento_id
+            )
+
+            # Guarda as chaves de atendimento
+            # apenas para validacao interna.
+
+            if tipo == "ATENDIMENTO":
+
+                if atendimento_id is not None:
+                    chaves_atendimentos.add(chave)
+
+                continue
+
+            if tipo != "MEDICAMENTO":
+                continue
+
+            campo_medicamento = (
+                informacoes.get("medicamento")
+            )
+
+            investigar_estrutura(
+                campo_medicamento
+            )
+
+            nome, origem_nome = (
+                extrair_nome_medicamento(
+                    campo_medicamento
                 )
-            except (ValueError, TypeError):
-                return None
+            )
 
-    return data
+            medicamentos.append({
+
+                "id_paciente_interno":
+                    id_paciente,
+
+                "id_normalizado":
+                    atendimento_id,
+
+                "medicamento":
+                    nome,
+
+                "origem_nome":
+                    origem_nome,
+
+                "tipo_estrutura":
+                    type(
+                        campo_medicamento
+                    ).__name__,
+
+                "via":
+                    texto_seguro(
+                        informacoes.get("via")
+                    ),
+
+                "dataAdministrada_original":
+                    informacoes.get(
+                        "dataAdministrada"
+                    ),
+
+                "dataEntrada_original":
+                    registro.get(
+                        "dataEntrada"
+                    ),
+
+                "dataCadastro_original":
+                    registro.get(
+                        "dataCadastro"
+                    )
+            })
+
+    med = pd.DataFrame(medicamentos)
+
+    print(
+        f"Registros de medicamentos: {len(med):,}"
+    )
+
+    return med, chaves_atendimentos
 
 
-# ==========================================================
-# 4. LIMPEZA DAS QUEIXAS
-# ==========================================================
+# ============================================================
+# 7. TRATAMENTO DOS CAMPOS
+# ============================================================
 
-PADROES_SINAIS_VITAIS = [
-    # Pressão arterial
-    r"\b(?:PA|PRESSAO)\s*[:=]?\s*\d+\s*[Xx/]\s*\d+(?:\s*MMHG)?\b",
+def tratar_medicamentos(med):
 
-    # Saturação
-    r"\b(?:SAT|SATO2|SPO2|SPO|STO2|ST)\s*[:=]?\s*\d+(?:[,.]\d+)?\s*%?\b",
+    if med.empty:
+        return med
 
-    # Frequência cardíaca
-    r"\b(?:FC|FREQUENCIA CARDIACA)\s*[:=]?\s*\d+(?:\s*BPM)?\b",
+    print("\nTRATANDO MEDICAMENTOS...")
 
-    # Temperatura
-    r"\b(?:TEMPERATURA|TEMP)\s*[:=]?\s*\d+(?:[,.]\d+)?\s*[°º]?\s*[Cc]?\b",
+    # Padroniza nomes para agregacao.
 
-    # Frequência respiratória
-    r"\b(?:FR|FREQUENCIA RESPIRATORIA)\s*[:=]?\s*\d+(?:\s*IRPM)?\b",
+    med["medicamento"] = (
+        med["medicamento"]
+        .map(normalizar_texto)
+    )
 
-    # Glicemia / dextro
-    r"\b(?:GLICEMIA|GLIC|DEXTRO|DX)\s*[:=]?\s*\d+\b",
+    med["medicamento"] = (
+        med["medicamento"]
+        .replace(
+            "",
+            "NAO IDENTIFICADO"
+        )
+    )
 
-    # Pulso
-    r"\b(?:PULSO|PU)\s*[:=]?\s*\d+\b",
+    med["via"] = (
+        med["via"]
+        .map(normalizar_texto)
+        .replace(
+            "",
+            "NAO INFORMADA"
+        )
+    )
 
-    # Peso
-    r"\bPESO\s*[:=]?\s*\d+(?:[,.]\d+)?\s*(?:KG)?\b",
+    # Converte as tres datas separadamente.
 
-    # Sinais vitais
-    r"\bSSVV\b"
-]
+    for campo in (
+        "dataAdministrada",
+        "dataEntrada",
+        "dataCadastro"
+    ):
 
-
-def limpar_queixa(texto):
-    if pd.isna(texto):
-        return pd.NA
-
-    texto = str(texto).upper()
-    texto = remover_acentos(texto)
-
-    # Remove os sinais vitais conhecidos
-    for padrao in PADROES_SINAIS_VITAIS:
-        texto = re.sub(
-            padrao,
-            " ",
-            texto,
-            flags=re.IGNORECASE
+        med[campo] = converter_coluna_datas(
+            med[f"{campo}_original"]
         )
 
-    # Remove valores isolados que sobraram de registros mal formatados
-    texto = re.sub(
-        r"(?<!\w)\d+(?:[,.]\d+)?\s*%",
-        " ",
-        texto
+    # Define a data de referencia.
+    #
+    # A prioridade continua:
+    # 1. Administracao
+    # 2. Entrada
+    # 3. Cadastro
+
+    med["data_referencia"] = (
+        med["dataAdministrada"]
+        .combine_first(
+            med["dataEntrada"]
+        )
+        .combine_first(
+            med["dataCadastro"]
+        )
     )
 
-    # Remove valores isolados de temperatura mal formatados
-    texto = re.sub(
-        r"\b\d{1,3}[,.]\d+\s*[°º]?\s*[Cc]\b",
-        " ",
-        texto
+    med["origem_data"] = "SEM DATA"
+
+    med.loc[
+        med["dataCadastro"].notna(),
+        "origem_data"
+    ] = "CADASTRO"
+
+    med.loc[
+        med["dataEntrada"].notna(),
+        "origem_data"
+    ] = "ENTRADA"
+
+    med.loc[
+        med["dataAdministrada"].notna(),
+        "origem_data"
+    ] = "ADMINISTRADA"
+
+    med["ano_mes"] = (
+        med["data_referencia"]
+        .dt.tz_localize(None)
+        .dt.to_period("M")
+        .astype("string")
     )
 
-    # Remove quebras de linha
-    texto = texto.replace("\r", " ")
-    texto = texto.replace("\n", " ")
-
-    # Remove pontuação
-    texto = re.sub(r"[.,;:!?]+", " ", texto)
-
-    # Remove símbolos de temperatura
-    texto = re.sub(r"[°º]+", " ", texto)
-
-    # Junta espaços duplicados
-    texto = re.sub(r"\s+", " ", texto)
-
-    texto = texto.strip()
-
-    return texto if texto else pd.NA
-
-# ==========================================================
-# 5. CLASSIFICAÇÃO DAS QUEIXAS
-# ==========================================================
-
-PADROES_ADMINISTRATIVOS = [
-
-    r"\bNAO RESPONDEU\b",
-    r"\bNAO RESPONDE\b",
-    r"\bNAO ATENDEU\b",
-    r"\bNAO ATENDE\b",
-    r"\bNAO AGUARDOU\b",
-    r"\bJA ATENDIDO\b",
-    r"\bJA ATENDIDA\b",
-    r"\bNAO COMPARECEU\b",
-    r"\bABANDONOU\b"
-]
+    return med
 
 
-PADROES_PROCEDIMENTOS = [
+# ============================================================
+# 8. AUDITORIA DA ESTRUTURA
+# ============================================================
 
-    r"\bMEDICACAO EXTERNA\b",
-    r"\bCURATIVO\b",
-    r"\bSUTURA\b",
-    r"\bRETIRADA DE PONTO\b",
-    r"\bRETIRADA DE PONTOS\b",
-    r"\bTROCA DE SNE\b",
-    r"\bTROCA DE SVD\b",
-    r"\bCOLETA\b",
-    r"\bAPLICACAO\b",
-    r"\bRAIO X\b",
-    r"\bRX\b",
-    r"\bULTRASSOM\b"
-]
+def auditar_estrutura(med):
 
+    print("\n" + "=" * 55)
+    print("AUDITORIA DA ESTRUTURA DOS MEDICAMENTOS")
+    print("=" * 55)
 
-PADROES_CLINICOS = [
+    print("\nTIPOS DO CAMPO MEDICAMENTO")
 
-    r"\bDOR\b",
-    r"\bFEBRE\b",
-    r"\bCEFALEIA\b",
-    r"\bTOSSE\b",
-    r"\bDIARREIA\b",
-    r"\bVOMITO\b",
-    r"\bNAUSEA\b",
-    r"\bTONTURA\b",
-    r"\bFALTA DE AR\b",
-    r"\bDISPNEIA\b",
-    r"\bCOLICA\b",
-    r"\bSANGRAMENTO\b",
-    r"\bARDENCIA\b",
-    r"\bFERIMENTO\b",
-    r"\bINCHACO\b",
-    r"\bTRAUMA\b",
-    r"\bLOMBALGIA\b",
-    r"\bODINOFAGIA\b",
-    r"\bENXAQUECA\b",
-    r"\bCONVULS\w*\b",
-    r"\bCRISE HIPERTENSIVA\b",
-    r"\bPICO HIPERTENSIVO\b",
-    r"\bQUEIMACAO\b",
-    r"\bCOCEIRA\b",
-    r"\bCORIZA\b",
-    r"\bMIALGIA\b"
-]
-
-
-def contem_padrao(texto, padroes):
-    """Verifica se algum padrão está presente no texto."""
-
-    return any(
-        re.search(padrao, texto)
-        for padrao in padroes
+    print(
+        med["tipo_estrutura"]
+        .value_counts()
+        .to_string()
     )
 
+    print("\nCAMPOS INTERNOS MAIS FREQUENTES")
 
-def classificar_queixa(texto):
-
-    if pd.isna(texto):
-        return "OUTROS"
-
-    texto = str(texto)
-
-    # Prioridade 1: administrativo
-    if contem_padrao(
-        texto,
-        PADROES_ADMINISTRATIVOS
+    for campo, quantidade in (
+        CONTAGEM_CAMPOS.most_common(25)
     ):
-        return "ADMINISTRATIVO"
 
-    # Prioridade 2: procedimento
-    if contem_padrao(
-        texto,
-        PADROES_PROCEDIMENTOS
-    ):
-        return "PROCEDIMENTO"
-
-    # Prioridade 3: clínica
-    if contem_padrao(
-        texto,
-        PADROES_CLINICOS
-    ):
-        return "CLINICA"
-
-    # Restante
-    return "OUTROS"
-
-
-# ==========================================================
-# 6. CONSTRUÇÃO DA TABELA DE ANÁLISE
-# ==========================================================
-
-dados_analise = []
-
-for paciente in df.itertuples(index=False):
-
-    registros = getattr(
-        paciente,
-        "registros",
-        []
-    )
-
-    if not isinstance(registros, list):
-        continue
-
-    for registro in registros:
-
-        if not isinstance(registro, dict):
-            continue
-
-        tipo = registro.get("tipo")
-
-        # Mantém somente TRIAGEM e ATENDIMENTO
-        if tipo not in {"TRIAGEM", "ATENDIMENTO"}:
-            continue
-
-        informacoes = registro.get(
-            "informacoes",
-            {}
+        print(
+            f"{campo}: {quantidade:,}"
         )
 
-        if not isinstance(informacoes, dict):
-            informacoes = {}
+    print("\nCAMINHOS MAIS FREQUENTES")
 
-        cid, cid_descricao = extrair_cid(
-            informacoes
+    for caminho, quantidade in (
+        CONTAGEM_CAMINHOS.most_common(25)
+    ):
+
+        print(
+            f"{caminho}: {quantidade:,}"
         )
 
-        dados_analise.append({
-
-            "tipo": tipo,
-
-            "atendimentoId":
-                informacoes.get("atendimentoId"),
-
-            "dataEntrada":
-                extrair_data(
-                    registro.get("dataEntrada")
-                ),
-
-            "queixa":
-                informacoes.get("queixa"),
-
-            "diagnostico":
-                informacoes.get("diagnostico"),
-
-            "cid":
-                cid,
-
-            "cid_descricao":
-                cid_descricao
-        })
-
-
-df_analise = pd.DataFrame(
-    dados_analise
-)
-
-
-# ==========================================================
-# 7. DATAS
-# ==========================================================
-
-df_analise["dataEntrada"] = pd.to_datetime(
-    df_analise["dataEntrada"],
-    utc=True,
-    errors="coerce"
-)
-
-df_analise["ano"] = (
-    df_analise["dataEntrada"].dt.year
-)
-
-df_analise["mes"] = (
-    df_analise["dataEntrada"].dt.month
-)
-
-df_analise["ano_mes"] = (
-    df_analise["dataEntrada"]
-    .dt.tz_localize(None)
-    .dt.to_period("M")
-)
-
-
-# ==========================================================
-# 8. SEPARAÇÃO DAS TABELAS
-# ==========================================================
-
-df_atendimentos = df_analise.loc[
-    df_analise["tipo"] == "ATENDIMENTO"
-].copy()
-
-
-df_triagens = df_analise.loc[
-    df_analise["tipo"] == "TRIAGEM"
-].copy()
-
-
-# ==========================================================
-# 9. LIMPEZA DAS QUEIXAS
-# ==========================================================
-
-df_triagens["queixa_limpa"] = (
-    df_triagens["queixa"]
-    .apply(limpar_queixa)
-)
-
-
-# ==========================================================
-# 10. CLASSIFICAÇÃO
-# ==========================================================
-
-df_triagens["tipo_queixa"] = (
-    df_triagens["queixa_limpa"]
-    .apply(classificar_queixa)
-)
-
-
-# ==========================================================
-# 11. INDICADORES PRINCIPAIS
-# ==========================================================
-
-total_registros = len(df)
-
-total_registros_analise = len(df_analise)
-
-total_atendimentos = len(
-    df_atendimentos
-)
-
-total_triagens = len(
-    df_triagens
-)
-
-atendimentos_com_cid = int(
-    df_atendimentos["cid"].notna().sum()
-)
-
-atendimentos_sem_cid = int(
-    df_atendimentos["cid"].isna().sum()
-)
-
-triagens_com_queixa = int(
-    df_triagens["queixa"].notna().sum()
-)
-
-triagens_sem_queixa = int(
-    df_triagens["queixa"].isna().sum()
-)
-
-
-# ==========================================================
-# 12. VOLUME DE ATENDIMENTOS
-# ==========================================================
-
-volume_por_ano = (
-
-    df_analise
-    .dropna(subset=["ano"])
-    .groupby(
-        ["ano", "tipo"]
+    print(
+        "\nA auditoria mostra apenas nomes de "
+        "campos e contagens, sem dados de pacientes."
     )
-    .size()
-    .reset_index(
-        name="quantidade"
+
+
+# ============================================================
+# 9. AUDITORIA DOS NOMES
+# ============================================================
+
+def auditar_nomes(med):
+
+    print("\n" + "=" * 55)
+    print("QUALIDADE DOS NOMES DOS MEDICAMENTOS")
+    print("=" * 55)
+
+    total = len(med)
+
+    identificados = int(
+        med["medicamento"]
+        .ne("NAO IDENTIFICADO")
+        .sum()
     )
-    .sort_values(
-        ["ano", "tipo"]
+
+    nao_identificados = (
+        total - identificados
     )
-)
 
-
-volume_mensal = (
-
-    df_analise
-    .dropna(subset=["ano_mes"])
-    .groupby(
-        ["ano_mes", "tipo"]
+    percentual = (
+        100 * identificados / total
+        if total else 0
     )
-    .size()
-    .reset_index(
-        name="quantidade"
+
+    print(f"Total de registros: {total:,}")
+
+    print(
+        f"Com nome identificado: "
+        f"{identificados:,}"
     )
-    .sort_values(
-        ["ano_mes", "tipo"]
+
+    print(
+        f"Sem nome identificado: "
+        f"{nao_identificados:,}"
     )
-)
 
-
-# ==========================================================
-# 13. CIDs MAIS FREQUENTES
-# ==========================================================
-
-cids_frequentes = (
-
-    df_atendimentos
-    .dropna(
-        subset=["cid"]
+    print(
+        f"Taxa de identificacao: "
+        f"{percentual:.2f}%"
     )
-    .groupby(
-        ["cid", "cid_descricao"]
+
+    print("\nORIGEM DOS NOMES EXTRAIDOS")
+
+    print(
+        med["origem_nome"]
+        .value_counts()
+        .head(20)
+        .to_string()
     )
-    .size()
-    .reset_index(
-        name="quantidade"
-    )
-    .sort_values(
-        "quantidade",
-        ascending=False
-    )
-)
 
+    print("\n15 NOMES MAIS FREQUENTES")
 
-# ==========================================================
-# 14. QUEIXAS MAIS FREQUENTES
-# ==========================================================
-
-queixas_frequentes = (
-
-    df_triagens
-    .dropna(
-        subset=["queixa_limpa"]
-    )
-    .groupby(
-        "queixa_limpa"
-    )
-    .size()
-    .reset_index(
-        name="quantidade"
-    )
-    .sort_values(
-        "quantidade",
-        ascending=False
-    )
-)
-
-
-# ==========================================================
-# 15. CATEGORIAS DE QUEIXA
-# ==========================================================
-
-quantidade_por_tipo_queixa = (
-
-    df_triagens
-    .groupby(
-        "tipo_queixa"
-    )
-    .size()
-    .reset_index(
-        name="quantidade"
-    )
-    .sort_values(
-        "quantidade",
-        ascending=False
-    )
-)
-
-
-# ==========================================================
-# 16. QUEIXAS POR PERÍODO
-# ==========================================================
-
-queixas_por_periodo = (
-
-    df_triagens
-    .dropna(
-        subset=[
-            "ano_mes",
-            "queixa_limpa"
+    frequencia = (
+        med.loc[
+            med["medicamento"]
+            != "NAO IDENTIFICADO",
+            "medicamento"
         ]
+        .value_counts()
+        .head(15)
     )
-    .groupby(
+
+    if frequencia.empty:
+
+        print(
+            "Nenhum nome identificado."
+        )
+
+    else:
+
+        print(
+            frequencia.to_string()
+        )
+
+    print(
+        "\nATENCAO: os nomes extraidos "
+        "ainda precisam de validacao."
+    )
+
+
+# ============================================================
+# 10. AUDITORIA DAS DATAS
+# ============================================================
+
+def auditar_datas(med):
+
+    print("\n" + "=" * 55)
+    print("AUDITORIA TEMPORAL")
+    print("=" * 55)
+
+    for campo in (
+        "dataAdministrada",
+        "dataEntrada",
+        "dataCadastro"
+    ):
+
+        validas = int(
+            med[campo].notna().sum()
+        )
+
+        print(
+            f"{campo}: {validas:,} datas validas"
+        )
+
+    print("\nORIGEM DA DATA DE REFERENCIA")
+
+    print(
+        med["origem_data"]
+        .value_counts()
+        .to_string()
+    )
+
+    print(
+        "\nDatas de referencia disponiveis: "
+        f"{med['data_referencia'].notna().sum():,}"
+    )
+
+    if med["data_referencia"].notna().any():
+
+        print(
+            "Primeira data: "
+            f"{med['data_referencia'].min()}"
+        )
+
+        print(
+            "Ultima data: "
+            f"{med['data_referencia'].max()}"
+        )
+
+    print(
+        "\nIMPORTANTE: a data de referencia "
+        "nao comprova administracao."
+    )
+
+
+# ============================================================
+# 11. VALIDACAO DOS VINCULOS
+# ============================================================
+
+def validar_vinculos(
+    med,
+    chaves_atendimentos
+):
+
+    print("\n" + "=" * 55)
+    print("VINCULOS MEDICAMENTOS / ATENDIMENTOS")
+    print("=" * 55)
+
+    vinculados = []
+
+    for id_paciente, atendimento_id in zip(
+        med["id_paciente_interno"],
+        med["id_normalizado"]
+    ):
+
+        chave = (
+            id_paciente,
+            atendimento_id
+        )
+
+        vinculados.append(
+            chave in chaves_atendimentos
+        )
+
+    med["vinculado_atendimento"] = (
+        vinculados
+    )
+
+    total = len(med)
+
+    validos = int(
+        med["vinculado_atendimento"].sum()
+    )
+
+    print(f"Registros: {total:,}")
+    print(f"Vinculados: {validos:,}")
+
+    print(
+        "Sem correspondencia: "
+        f"{total - validos:,}"
+    )
+
+    return med
+
+
+# ============================================================
+# 12. EXPORTACAO DOS RESULTADOS
+# ============================================================
+
+def exportar_resultados(med):
+
+    print("\n" + "=" * 55)
+    print("EXPORTACAO DOS ARQUIVOS")
+    print("=" * 55)
+
+    # --------------------------------------------------------
+    # 1. Frequencia dos medicamentos
+    # --------------------------------------------------------
+
+    frequencia = (
+        med.groupby(
+            "medicamento",
+            dropna=False
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+        .sort_values(
+            "qtd_registros",
+            ascending=False
+        )
+    )
+
+    exportar_csv(
+        frequencia,
+        "frequencia_medicamentos.csv"
+    )
+
+    # --------------------------------------------------------
+    # 2. Medicamentos por mes
+    # --------------------------------------------------------
+
+    por_mes = (
+        med.groupby(
+            [
+                "ano_mes",
+                "medicamento",
+                "origem_data"
+            ],
+            dropna=False
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+    )
+
+    exportar_csv(
+        por_mes,
+        "medicamentos_por_mes.csv"
+    )
+
+    # --------------------------------------------------------
+    # 3. Medicamentos por via
+    # --------------------------------------------------------
+
+    por_via = (
+        med.groupby(
+            "via",
+            dropna=False
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+        .sort_values(
+            "qtd_registros",
+            ascending=False
+        )
+    )
+
+    exportar_csv(
+        por_via,
+        "medicamentos_por_via.csv"
+    )
+
+    # --------------------------------------------------------
+    # 4. Qualidade dos nomes
+    # --------------------------------------------------------
+
+    qualidade_nomes = (
+        med.groupby(
+            [
+                "tipo_estrutura",
+                "origem_nome"
+            ],
+            dropna=False
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+    )
+
+    exportar_csv(
+        qualidade_nomes,
+        "qualidade_nomes_medicamentos.csv"
+    )
+
+    # --------------------------------------------------------
+    # 5. Qualidade das datas
+    # --------------------------------------------------------
+
+    qualidade_datas = (
+        med.groupby(
+            "origem_data",
+            dropna=False
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+    )
+
+    exportar_csv(
+        qualidade_datas,
+        "qualidade_datas_medicamentos.csv"
+    )
+
+    # --------------------------------------------------------
+    # 6. Vias por mes
+    # --------------------------------------------------------
+
+    vias_mes = (
+        med.groupby(
+            [
+                "ano_mes",
+                "via",
+                "origem_data"
+            ],
+            dropna=False
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+    )
+
+    exportar_csv(
+        vias_mes,
+        "vias_por_mes.csv"
+    )
+
+    # --------------------------------------------------------
+    # 7. VINCULOS
+    # --------------------------------------------------------
+
+    resumo_vinculos = (
+        med.groupby(
+            "vinculado_atendimento"
+        )
+        .size()
+        .reset_index(
+            name="qtd_registros"
+        )
+    )
+
+    exportar_csv(
+        resumo_vinculos,
+        "qualidade_vinculos_medicamentos.csv"
+    )
+
+    # --------------------------------------------------------
+    # 8. Estrutura dos campos
+    # --------------------------------------------------------
+
+    estrutura = pd.DataFrame(
         [
-            "ano_mes",
-            "queixa_limpa"
+            {
+                "campo": campo,
+                "qtd_ocorrencias": quantidade
+            }
+            for campo, quantidade
+            in CONTAGEM_CAMINHOS.items()
         ]
     )
-    .size()
-    .reset_index(
-        name="quantidade"
+
+    if not estrutura.empty:
+
+        estrutura = estrutura.sort_values(
+            "qtd_ocorrencias",
+            ascending=False
+        )
+
+    exportar_csv(
+        estrutura,
+        "estrutura_medicamentos.csv"
     )
-)
 
+    print("\nEXPORTACAO CONCLUIDA")
 
-# ==========================================================
-# 17. CIDs POR PERÍODO
-# ==========================================================
-
-cids_por_periodo = (
-
-    df_atendimentos
-    .dropna(
-        subset=[
-            "ano_mes",
-            "cid"
-        ]
+    print(
+        f"Pasta de resultados: {PASTA_SAIDA}"
     )
-    .groupby(
-        [
-            "ano_mes",
-            "cid",
-            "cid_descricao"
-        ]
+
+    print(
+        "Somente tabelas agregadas foram exportadas."
     )
-    .size()
-    .reset_index(
-        name="quantidade"
+
+    print(
+        "O JSON original nao foi alterado."
     )
-)
 
 
-# ==========================================================
-# 18. RESULTADO RESUMIDO
-# ==========================================================
+# ============================================================
+# 13. EXECUCAO PRINCIPAL
+# ============================================================
 
-print(
-    f"""
-============================================================
-BANCO DE DADOS CARREGADO
-============================================================
+if __name__ == "__main__":
 
-Registros originais:       {total_registros:,}
-Registros para análise:    {total_registros_analise:,}
+    if MODO not in {
+        "AUDITORIA",
+        "COMPLETO"
+    }:
 
-Atendimentos:              {total_atendimentos:,}
-Triagens:                   {total_triagens:,}
+        raise ValueError(
+            "MODO deve ser AUDITORIA ou COMPLETO."
+        )
 
-Atendimentos com CID:      {atendimentos_com_cid:,}
-Atendimentos sem CID:      {atendimentos_sem_cid:,}
+    print("\n" + "=" * 55)
+    print("PROJETO INTEGRADOR I - VERSAO 3.6")
+    print("=" * 55)
 
-Triagens com queixa:       {triagens_com_queixa:,}
-Triagens sem queixa:       {triagens_sem_queixa:,}
+    banco = carregar_banco()
 
-Queixas clínicas:           {
-    int(
-        quantidade_por_tipo_queixa.loc[
-            quantidade_por_tipo_queixa["tipo_queixa"] == "CLINICA",
-            "quantidade"
-        ].sum()
+    medicamentos, chaves_atendimentos = (
+        extrair_registros(banco)
     )
-:,}
 
-Queixas de procedimento:    {
-    int(
-        quantidade_por_tipo_queixa.loc[
-            quantidade_por_tipo_queixa["tipo_queixa"] == "PROCEDIMENTO",
-            "quantidade"
-        ].sum()
-    )
-:,}
+    if medicamentos.empty:
 
-Queixas administrativas:    {
-    int(
-        quantidade_por_tipo_queixa.loc[
-            quantidade_por_tipo_queixa["tipo_queixa"] == "ADMINISTRATIVO",
-            "quantidade"
-        ].sum()
-    )
-:,}
+        print(
+            "Nenhum registro de medicamento encontrado."
+        )
 
-============================================================
-PROCESSAMENTO CONCLUÍDO
-============================================================
-"""
-)
+    else:
 
-print("\nEXEMPLOS DE LIMPEZA DAS QUEIXAS")
-print("=" * 60)
+        medicamentos = tratar_medicamentos(
+            medicamentos
+        )
 
-print(
-    df_triagens[
-        ["queixa", "queixa_limpa"]
-    ]
-    .dropna(subset=["queixa_limpa"])
-    .head(20)
-    .to_string(index=False)
-)
+        auditar_estrutura(
+            medicamentos
+        )
+
+        auditar_nomes(
+            medicamentos
+        )
+
+        auditar_datas(
+            medicamentos
+        )
+
+        medicamentos = validar_vinculos(
+            medicamentos,
+            chaves_atendimentos
+        )
+
+        if MODO == "COMPLETO":
+
+            exportar_resultados(
+                medicamentos
+            )
+
+    print("\nPROCESSAMENTO FINALIZADO.")
